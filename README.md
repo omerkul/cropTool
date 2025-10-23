@@ -48,6 +48,21 @@ python script.py input_video.mp4 -d -v
 
 This creates an image showing the detected screen boundaries before processing.
 
+### Manual Region Selection (Most Accurate!)
+
+**For precise control, manually select screen regions interactively:**
+```bash
+python script.py input_video.mp4 -m
+```
+
+This opens an interactive window where you can:
+1. Click and drag to draw rectangles around each screen
+2. Press 'r' to reset if you make a mistake
+3. Press 'Enter' when done selecting all screens
+4. Press 'q' to cancel
+
+Manual selection is recommended when auto-detection doesn't work well or when you need exact boundaries.
+
 ### Specify Number of Screens
 
 For 2-screen layout:
