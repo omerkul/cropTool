@@ -315,7 +315,7 @@ class ActiveScreenDetector:
             frame: Input frame to split
 
         Returns:
-            List of screen regions (all normalized to same size)
+            List of screen regions
         """
         # Use auto-detected regions if available
         if self.auto_detect and self.screen_regions:
@@ -326,10 +326,12 @@ class ActiveScreenDetector:
                 y = max(0, min(y, frame.shape[0] - 1))
                 w = min(w, frame.shape[1] - x)
                 h = min(h, frame.shape[0] - y)
-                screens.append(frame[y:y+h, x:x+w])
 
-            # Normalize all screens to the same size
-            return self._normalize_screen_sizes(screens)
+                # Extract and copy to avoid memory issues
+                screen = frame[y:y+h, x:x+w].copy()
+                screens.append(screen)
+
+            return screens
 
         # Otherwise use equal split
         h, w = frame.shape[:2]
@@ -553,47 +555,113 @@ class ActiveScreenDetector:
 
     def process_video(self, output_path: str, show_preview: bool = False):
         """
-        Process video and create single-screen output
+        Process video and create single-screen output with H.264 compression
+        Uses ffmpeg for both reading and writing to avoid OpenCV segfaults
 
         Args:
             output_path: Path for output video file
             show_preview: Whether to show live preview (slower)
         """
+        import subprocess
+
         print(f"\nProcessing video...")
         print(f"Output will be saved to: {output_path}")
 
-        # Get first frame to determine output size
-        ret, frame = self.cap.read()
-        if not ret:
+        # Use ffmpeg to read frames (avoids OpenCV segfaults)
+        ffmpeg_read_cmd = [
+            'ffmpeg',
+            '-i', self.video_path,
+            '-f', 'image2pipe',
+            '-pix_fmt', 'bgr24',
+            '-vcodec', 'rawvideo',
+            '-'
+        ]
+
+        # Start ffmpeg reader
+        ffmpeg_reader = subprocess.Popen(
+            ffmpeg_read_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=10**8
+        )
+
+        # Read first frame to determine output size
+        raw_frame = ffmpeg_reader.stdout.read(self.width * self.height * 3)
+        if len(raw_frame) != self.width * self.height * 3:
+            ffmpeg_reader.kill()
             raise ValueError("Could not read first frame")
 
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
         screens = self.split_screens(frame)
-        out_h, out_w = screens[0].shape[:2]
+
+        # Determine max dimensions across all screens
+        max_h = max(screen.shape[0] for screen in screens)
+        max_w = max(screen.shape[1] for screen in screens)
+
+        # H.264 requires dimensions divisible by 2
+        out_h = max_h if max_h % 2 == 0 else max_h + 1
+        out_w = max_w if max_w % 2 == 0 else max_w + 1
 
         print(f"Output screen size: {out_w}x{out_h}")
+        if out_w != max_w or out_h != max_h:
+            print(f"   (adjusted from {max_w}x{max_h} to be divisible by 2)")
+        print(f"Individual screen sizes:")
+        for idx, screen in enumerate(screens):
+            print(f"   Screen {idx + 1}: {screen.shape[1]}x{screen.shape[0]}")
 
-        # Setup video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, self.fps, (out_w, out_h))
+        # Create temporary output (no audio)
+        temp_output = output_path.replace('.mp4', '_temp.mp4')
 
-        # Reset to beginning
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # Start ffmpeg writer for H.264 encoding
+        ffmpeg_write_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{out_w}x{out_h}',
+            '-r', str(self.fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'fast',  # Faster encoding, still good compression
+            '-crf', '28',  # Higher CRF = more compression (18-28, higher = smaller files)
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',  # Better for streaming/playback
+            temp_output
+        ]
+
+        print("🎬 Starting H.264 encoder...")
+        ffmpeg_writer = subprocess.Popen(
+            ffmpeg_write_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE
+        )
+
+        # Restart reader from beginning
+        ffmpeg_reader.kill()
+        ffmpeg_reader.wait()
+        ffmpeg_reader = subprocess.Popen(
+            ffmpeg_read_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=10**8
+        )
 
         # Processing variables
         prev_screens = None
         current_active = 0
         frame_count = 0
-
-        # Smoothing buffer
         active_buffer = deque(maxlen=self.smoothing_window)
 
         try:
             while True:
-                # Read frame (FFmpeg warnings are suppressed via environment variable)
-                ret, frame = self.cap.read()
+                # Read frame using ffmpeg (not OpenCV!)
+                raw_frame = ffmpeg_reader.stdout.read(self.width * self.height * 3)
 
-                if not ret:
+                if len(raw_frame) != self.width * self.height * 3:
                     break
+
+                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
 
                 # Split into screens
                 screens = self.split_screens(frame)
@@ -605,26 +673,39 @@ class ActiveScreenDetector:
                 if active_idx != -1:
                     active_buffer.append(active_idx)
 
-                # Get most common screen in buffer (temporal smoothing)
+                # Get most common screen in buffer
                 if len(active_buffer) > 0:
                     current_active = max(set(active_buffer), key=active_buffer.count)
 
-                # Write active screen to output
+                # Get active screen
                 active_screen = screens[current_active].copy()
 
+                # Resize to match output dimensions if needed
+                if active_screen.shape[0] != out_h or active_screen.shape[1] != out_w:
+                    active_screen = cv2.resize(active_screen, (out_w, out_h),
+                                              interpolation=cv2.INTER_LINEAR)
 
-                out.write(active_screen)
+                # Write to ffmpeg
+                try:
+                    ffmpeg_writer.stdin.write(active_screen.tobytes())
+                except BrokenPipeError:
+                    stderr_output = ffmpeg_writer.stderr.read().decode()
+                    print(f"\n❌ Encoding process failed: {stderr_output}")
+                    break
 
                 # Show preview if requested
                 if show_preview:
-                    cv2.imshow('Active Screen Output', active_screen)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        print("\nProcessing cancelled by user")
-                        break
+                    try:
+                        cv2.imshow('Active Screen Output', active_screen)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            print("\nProcessing cancelled by user")
+                            break
+                    except:
+                        show_preview = False
 
                 # Update progress
                 frame_count += 1
-                if frame_count % 30 == 0:  # Update every 30 frames
+                if frame_count % 30 == 0:
                     progress = (frame_count / self.total_frames) * 100
                     print(f"Progress: {progress:.1f}% ({frame_count}/{self.total_frames} frames)", end='\r')
 
@@ -632,13 +713,32 @@ class ActiveScreenDetector:
 
         finally:
             # Cleanup
-            self.cap.release()
-            out.release()
+            ffmpeg_reader.kill()
+            ffmpeg_reader.wait()
+            if ffmpeg_writer.stdin:
+                ffmpeg_writer.stdin.close()
+            ffmpeg_writer.wait()
             if show_preview:
                 cv2.destroyAllWindows()
 
         print(f"\n\n✅ Video processing complete!")
         print(f"Processed {frame_count} frames")
+
+        # Rename temp file to final output
+        import shutil
+        if os.path.exists(temp_output):
+            # Show file size comparison
+            input_size = os.path.getsize(self.video_path) / (1024 * 1024)  # MB
+            temp_size = os.path.getsize(temp_output) / (1024 * 1024)  # MB
+            print(f"\n📦 File size comparison:")
+            print(f"   Input:  {input_size:.1f} MB")
+            print(f"   Output: {temp_size:.1f} MB")
+            print(f"   Ratio:  {temp_size/input_size*100:.1f}% of original")
+
+            shutil.move(temp_output, output_path)
+        else:
+            print(f"❌ Error: Output file was not created properly")
+            return
 
         # Add audio from original video
         print("\n🎵 Adding audio from original video...")
